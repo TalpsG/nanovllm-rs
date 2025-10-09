@@ -79,7 +79,7 @@ impl Config {
     }
 
     /// Update derived fields based on the HuggingFace configuration.
-    fn apply_hf_overrides(&mut self, hf_config: &Qwen3Config) -> Result<()> {
+    pub fn apply_hf_overrides(&mut self, hf_config: &Qwen3Config) -> Result<()> {
         if hf_config.max_position_embeddings > 0 {
             self.max_model_len = self.max_model_len.min(hf_config.max_position_embeddings);
         }
@@ -130,7 +130,7 @@ impl Default for Config {
     }
 }
 
-fn extract_eos_token_id(value: &Value) -> isize {
+pub fn extract_eos_token_id(value: &Value) -> isize {
     match value {
         Value::Number(number) => number.as_i64().map(|v| v as isize).unwrap_or(-1),
         Value::Array(values) => values
@@ -205,7 +205,7 @@ pub struct Qwen3Config {
 }
 
 impl Qwen3Config {
-    fn apply_post_init(&mut self) {
+    pub fn apply_post_init(&mut self) {
         if self.num_key_value_heads == 0 {
             self.num_key_value_heads = self.num_attention_heads;
         }
@@ -271,7 +271,7 @@ impl Default for Qwen3Config {
     }
 }
 
-fn compute_layer_types(
+pub fn compute_layer_types(
     num_layers: usize,
     sliding_window: Option<usize>,
     max_window_layers: usize,
@@ -287,15 +287,15 @@ fn compute_layer_types(
     layers
 }
 
-fn default_attention_bias() -> bool {
+pub fn default_attention_bias() -> bool {
     false
 }
 
-fn default_attention_dropout() -> f32 {
+pub fn default_attention_dropout() -> f32 {
     0.0
 }
 
-fn default_bos_token_id() -> Value {
+pub fn default_bos_token_id() -> Value {
     Value::Null
 }
 

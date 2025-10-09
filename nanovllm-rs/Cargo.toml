@@ -4,10 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda"] }
+candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.1", features = ["cuda","cudnn"] }
 anyhow = "1"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+tokenizers = "0.22.1"
+xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
+candle-nn = { version = "0.9.1", features = ["cuda","cudnn"], git = "https://github.com/huggingface/candle.git" }
+hf-hub = "0.4.3"
+lazy_static = "1.5.0"
+rand = "0.8"
+candle-flash-attn = { version = "0.9.1", features = ["cudnn"] }
 
 [dev-dependencies]
 tempfile = "3"

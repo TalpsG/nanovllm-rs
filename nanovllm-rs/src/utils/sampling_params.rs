@@ -12,7 +12,7 @@ pub struct SamplingParams {
 }
 
 impl SamplingParams {
-    const MIN_TEMPERATURE: f32 = 1e-10;
+    pub const MIN_TEMPERATURE: f32 = 1e-10;
 
     /// Create a new set of sampling parameters, ensuring invariants hold.
     pub fn new(temperature: f32, max_tokens: usize, ignore_eos: bool) -> Result<Self> {
