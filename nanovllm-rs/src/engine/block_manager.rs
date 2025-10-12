@@ -1,9 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
+use tracing::{debug, instrument, trace};
 use xxhash_rust::xxh64::Xxh64;
 
 use crate::engine::sequence::Sequence;
 
+#[instrument(skip(token_ids))]
 pub fn compute_hash(token_ids: &[u32], prefix: Option<u64>) -> u64 {
     let u8_slice = unsafe {
         std::slice::from_raw_parts(
@@ -43,14 +45,15 @@ impl Block {
         self.token_ids = None;
     }
 }
-struct BlockManager {
-    pub block_size: usize,
-    pub blocks: Vec<Block>,
-    pub free_block_ids: Vec<usize>,
-    pub used_block_ids: HashSet<usize>,
+pub struct BlockManager {
+    block_size: usize,
+    blocks: Vec<Block>,
+    free_block_ids: Vec<usize>,
+    used_block_ids: HashSet<usize>,
     hash_to_block_id: HashMap<u64, usize>,
 }
 impl BlockManager {
+    #[instrument]
     pub fn new(num_blocks: usize, block_size: usize) -> Self {
         let mut blocks = Vec::with_capacity(num_blocks);
         for i in 0..num_blocks {
@@ -81,77 +84,124 @@ impl BlockManager {
         self.used_block_ids.remove(&block_id);
         self.free_block_ids.push(block_id);
     }
+    #[instrument(skip(self, seq), fields(seq_id = seq.seq_id()))]
     pub fn can_allocate(&self, seq: &Sequence) -> bool {
-        self.free_block_ids.len() >= seq.num_blocks()
+        let can_allocate = self.free_block_ids.len() >= seq.num_blocks();
+        trace!(
+            available = self.free_block_ids.len(),
+            needed = seq.num_blocks(),
+            can_allocate
+        );
+        can_allocate
     }
+    #[instrument(skip(self, seq), fields(seq_id = seq.seq_id()))]
     pub fn allocate(&mut self, seq: &mut Sequence) {
-        let mut h = None;
+        assert!(
+            seq.block_table().is_empty(),
+            "sequence already has allocated blocks"
+        );
+        let mut h: Option<u64> = None;
         let mut cache_miss = false;
-        for i in 0..seq.num_blocks() {
-            {
-                let token_ids = seq.block(i);
-                h = if token_ids.len() == self.block_size {
-                    Some(compute_hash(token_ids, h))
-                } else {
-                    None
-                };
-            }
-            // use None represents not found
-            let block_id = h
-                .map(|hash| self.hash_to_block_id.get(&hash).copied())
-                .flatten();
-            if block_id.is_none() {
-                cache_miss = true;
-            } else if let Some(id) = block_id
-                && let Some(block_tokens) = self.blocks[id].token_ids.as_ref()
-                && block_tokens.as_slice() != seq.block(i)
-            {
-                cache_miss = true;
-            }
-            let block;
-            if cache_miss {
-                let block_id = self.free_block_ids[0];
-                block = self._allocate_block(block_id);
+
+        for block_idx in 0..seq.num_blocks() {
+            let block_tokens = seq.block(block_idx).to_vec();
+            let token_ids = block_tokens.as_slice();
+            h = if token_ids.len() == self.block_size {
+                Some(compute_hash(token_ids, h))
             } else {
-                assert!(block_id.is_some());
-                let id = block_id.unwrap();
+                None
+            };
+
+            let mut block_id = if cache_miss {
+                None
+            } else {
+                h.and_then(|hash| self.hash_to_block_id.get(&hash).copied())
+            };
+
+            if !cache_miss {
+                if let Some(id) = block_id {
+                    if let Some(stored) = self.blocks[id].token_ids.as_ref() {
+                        if stored.as_slice() != token_ids {
+                            cache_miss = true;
+                        }
+                    } else {
+                        cache_miss = true;
+                    }
+                } else {
+                    cache_miss = true;
+                }
+            }
+
+            let block_ref: &mut Block;
+            if cache_miss {
+                let next_id = *self
+                    .free_block_ids
+                    .first()
+                    .expect("insufficient free blocks during allocation");
+                block_id = Some(next_id);
+                block_ref = self._allocate_block(next_id);
+                trace!(block_id = next_id, "allocating new block for cache miss");
+            } else {
+                let id = block_id.expect("block id must be present when cache hit");
                 seq.num_cached_tokens += self.block_size;
                 if self.used_block_ids.contains(&id) {
-                    block = &mut self.blocks[id];
-                    block.ref_count += 1;
+                    block_ref = &mut self.blocks[id];
+                    block_ref.ref_count += 1;
+                    trace!(
+                        block_id = id,
+                        ref_count = block_ref.ref_count,
+                        "reusing cached block"
+                    );
                 } else {
-                    block = self._allocate_block(id);
+                    block_ref = self._allocate_block(id);
                 }
             }
-            if let Some(block_id) = block_id {
-                if let Some(hash) = h {
-                    block.update(hash, seq.block(i));
-                    self.hash_to_block_id.insert(hash, block_id);
-                }
 
-                seq.block_table.push(block_id);
+            if let Some(id) = block_id {
+                if let Some(hash) = h {
+                    block_ref.update(hash, token_ids);
+                    self.hash_to_block_id.insert(hash, id);
+                } else {
+                    block_ref.hash = None;
+                    block_ref.token_ids = None;
+                }
+                seq.block_table_mut().push(id);
             }
         }
+        debug!(
+            cached_tokens = seq.num_cached_tokens(),
+            total_blocks = seq.block_table().len(),
+            "sequence allocation complete"
+        );
     }
+    #[instrument(skip(self, seq), fields(seq_id = seq.seq_id()))]
     pub fn deallocate(&mut self, seq: &mut Sequence) {
         for &block_id in seq.block_table.iter().rev() {
             let block = &mut self.blocks[block_id];
             block.ref_count -= 1;
             if block.ref_count == 0 {
+                trace!(block_id, "freeing block");
                 self._deallocate_block(block_id);
             }
         }
         seq.num_cached_tokens = 0;
         seq.block_table.clear();
     }
+    #[instrument(skip(self, seq), fields(seq_id = seq.seq_id()))]
     pub fn can_append(&self, seq: &Sequence) -> bool {
         let last_block_size = seq.len() % self.block_size;
-        if last_block_size == 1 {
+        let can_append = if last_block_size == 1 {
             self.free_block_ids.len() >= 1
         } else {
             true
-        }
+        };
+        trace!(
+            available = self.free_block_ids.len(),
+            last_block_size, can_append
+        );
+        can_append
     }
+    #[instrument(skip(self, seq), fields(seq_id = seq.seq_id()))]
     pub fn may_append(&mut self, seq: &mut Sequence) {
         let id = seq.block_table[seq.block_table.len() - 1];
         if seq.len() % self.block_size == 1 {
@@ -159,6 +209,7 @@ impl BlockManager {
             assert!(last_block.hash.is_some());
             let block_id = self.free_block_ids[0];
             let _ = self._allocate_block(block_id);
+            trace!(new_block_id = block_id, "allocating new block for append");
             seq.block_table.push(block_id);
         } else if seq.len() % self.block_size == 0 {
             assert!(self.blocks[id].hash.is_none());
@@ -172,6 +223,7 @@ impl BlockManager {
             let last_block = &mut self.blocks[id];
             last_block.update(h, token_ids);
             self.hash_to_block_id.insert(h, last_block.block_id);
+            trace!(block_id = id, "finalised block hash after append");
         } else {
             assert!(self.blocks[id].hash.is_none());
         }

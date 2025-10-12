@@ -2,6 +2,7 @@ use std::ops::Index;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, ensure};
+use tracing::{debug, instrument};
 
 use crate::utils::sampling_params::SamplingParams;
 
@@ -33,6 +34,7 @@ impl Sequence {
     pub const BLOCK_SIZE: usize = 256;
 
     /// Construct a new sequence from prompt tokens and sampling parameters.
+    #[instrument(skip(token_ids, sampling_params))]
     pub fn new(token_ids: Vec<u32>, sampling_params: SamplingParams) -> Result<Self> {
         ensure!(
             !token_ids.is_empty(),
@@ -151,10 +153,16 @@ impl Sequence {
         &self.sampling_params
     }
 
+    #[instrument(skip(self))]
     pub fn append_token(&mut self, token_id: u32) {
         self.token_ids.push(token_id);
         self.last_token = token_id;
         self.num_tokens += 1;
+        debug!(
+            seq_id = self.seq_id,
+            num_tokens = self.num_tokens,
+            "appended token"
+        );
     }
 
     pub fn block(&self, index: usize) -> &[u32] {

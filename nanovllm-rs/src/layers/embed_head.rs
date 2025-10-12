@@ -1,5 +1,5 @@
 use candle_core::{Error, IndexOp, Result, Tensor};
-use candle_nn::{Embedding, Linear, Module, VarBuilder, embedding, linear};
+use candle_nn::{Embedding, Linear, Module, VarBuilder, embedding, linear_b};
 
 use crate::utils::context::get_context;
 
@@ -37,7 +37,7 @@ impl ParallelLMHead {
         vb: VarBuilder,
     ) -> Result<Self> {
         Ok(Self {
-            linear: linear(embedding_dim, num_embeddings, vb)?,
+            linear: linear_b(embedding_dim, num_embeddings, bias, vb)?,
             num_embeddings,
             embedding_dim,
             bias,

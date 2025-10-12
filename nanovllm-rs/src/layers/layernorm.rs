@@ -1,7 +1,4 @@
-use candle_core::{
-    Result, Tensor,
-    cuda::{cudarc::driver::sys::CUDA_EVENT_RECORD_NODE_PARAMS_st, kernels::Module},
-};
+use candle_core::{DType, Result, Tensor};
 use candle_nn::{Init, VarBuilder};
 
 pub struct RMSNorm {
@@ -10,23 +7,39 @@ pub struct RMSNorm {
 }
 
 impl RMSNorm {
-    pub fn new(eps: Option<f32>, vb: VarBuilder) -> Self {
+    pub fn new(size: usize, eps: Option<f32>, vb: VarBuilder) -> Result<Self> {
         let eps = eps.unwrap_or(1e-6);
-        let weight = vb.get_with_hints((1,), "weight", Init::Const(1.)).unwrap();
-        Self { weight, eps }
+        let weight = vb.get_with_hints((size,), "weight", Init::Const(1.))?;
+        Ok(Self { weight, eps })
     }
-    fn rms_forward(&self, x: &Tensor) -> Result<Tensor> {
-        let orig_dtype = x.dtype();
-        let mut x1 = x.to_dtype(candle_core::DType::F32)?;
-        let dims = x1.dims().len();
-        let mut var = x1.powf(2.)?.mean_keepdim(dims - 1)?;
-        let var_shape = var.shape();
-        let eps_tensor = Tensor::full(self.eps, var_shape, x.device())?;
+
+    fn normalize_from_f32(&self, x_f32: &Tensor) -> Result<Tensor> {
+        let last_dim = x_f32.dims().len().saturating_sub(1);
+        let mut var = x_f32.powf(2.)?.mean_keepdim(last_dim)?;
+        let eps_tensor = Tensor::full(self.eps, var.shape(), x_f32.device())?;
         var = var.broadcast_add(&eps_tensor)?;
         let rsqrt = var.sqrt()?.recip()?;
-        x1 = x1.broadcast_mul(&rsqrt)?;
-        x1 = x1.to_dtype(orig_dtype)?.broadcast_mul(&self.weight)?;
-        Ok(x1)
+        x_f32.broadcast_mul(&rsqrt)
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let orig_dtype = x.dtype();
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let normalized_f32 = self.normalize_from_f32(&x_f32)?;
+        let normalized = normalized_f32.to_dtype(orig_dtype)?;
+        normalized.broadcast_mul(&self.weight)
+    }
+
+    pub fn forward_with_residual(&self, x: &Tensor, residual: &Tensor) -> Result<(Tensor, Tensor)> {
+        let orig_dtype = x.dtype();
+        let x_f32 = x.to_dtype(DType::F32)?;
+        let residual_f32 = residual.to_dtype(DType::F32)?;
+        let summed = x_f32.broadcast_add(&residual_f32)?;
+        let residual_out = summed.to_dtype(orig_dtype)?;
+        let normalized_f32 = self.normalize_from_f32(&summed)?;
+        let normalized = normalized_f32.to_dtype(orig_dtype)?;
+        let output = normalized.broadcast_mul(&self.weight)?;
+        Ok((output, residual_out))
     }
 }
 
@@ -62,11 +75,11 @@ mod tests {
         let candle_rms = layer_norm::rms_norm(size, eps as f64, vb_candle)?;
 
         let vb_dummy = VarBuilder::zeros(DType::F32, &device);
-        let mut custom_rms = RMSNorm::new(Some(eps), vb_dummy);
+        let mut custom_rms = RMSNorm::new(size, Some(eps), vb_dummy)?;
         custom_rms.weight = weight.clone();
 
         let expected = candle_rms.forward(&xs)?;
-        let actual = custom_rms.rms_forward(&xs)?;
+        let actual = custom_rms.forward(&xs)?;
 
         let expected_data = expected.to_vec2::<f32>()?;
         let actual_data = actual.to_vec2::<f32>()?;
