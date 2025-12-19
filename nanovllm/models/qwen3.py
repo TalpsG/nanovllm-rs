@@ -77,6 +77,7 @@ class Qwen3Attention(nn.Module):
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim))
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         q, k = self.rotary_emb(positions, q, k)
+        print(f"q.shape: {q.shape}")
         o = self.attn(q, k, v)
         output = self.o_proj(o.flatten(1, -1))
         return output

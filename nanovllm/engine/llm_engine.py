@@ -4,12 +4,14 @@ from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
+import time
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+import nanovllm.utils.profile as profile
 
 
 class LLMEngine:
@@ -47,7 +49,12 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        start = time.perf_counter() 
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        if not is_prefill :
+            profile._DECODE_COST.append(time.perf_counter() - start)
+        else:
+            profile._PREFILL_COST.append(time.perf_counter() - start)
         self.scheduler.postprocess(seqs, token_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)

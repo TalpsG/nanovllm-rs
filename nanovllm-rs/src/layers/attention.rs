@@ -1,7 +1,14 @@
+use std::{cell::{OnceCell, RefCell}, hint::black_box, time::{Duration, Instant}};
+
 use candle_core::{DType, IndexOp, Result, Tensor, bail};
 use candle_flash_attn::flash_attn_varlen;
+use lazy_static::lazy_static;
+use tracing::{debug, instrument, trace};
 
 use crate::utils::context::get_context;
+
+// use lazy static define a global static ref to store flash-attn profiling info
+// no concurrent write access is expected so we don't need RwLock
 
 /// FlashAttention-backed multi-head attention with an optional KV cache.
 ///
@@ -16,11 +23,17 @@ pub struct Attention {
     pub num_kv_heads: usize,
     pub k_cache: Option<Tensor>,
     pub v_cache: Option<Tensor>,
+
+    // profile
+    pub flash_attn_cost: RefCell<u64>,
+    pub store_in_cache_cost: RefCell<u64>,
 }
 
 impl Attention {
     pub fn new(num_heads: usize, head_dim: usize, scale: f32, num_kv_heads: usize) -> Self {
         Self {
+            flash_attn_cost: RefCell::new(0),
+            store_in_cache_cost: RefCell::new(0),
             num_heads,
             head_dim,
             scale,
@@ -37,6 +50,7 @@ impl Attention {
     }
 
     pub fn forward(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+        println!("q.shape: {:?},k.shape: {:?},v.shape: {:?}", q.shape(), k.shape(), v.shape());
         let context_handle = get_context();
         let guard = context_handle
             .read()
@@ -49,7 +63,12 @@ impl Attention {
         ensure_rank3(k, "key")?;
         ensure_rank3(v, "value")?;
 
+        let cache_attached = self.k_cache.is_some() && self.v_cache.is_some();
+        trace!(cache_attached = cache_attached, "kv cache status");
+
+        
         if let (Some(k_cache), Some(v_cache)) = (&self.k_cache, &self.v_cache) {
+            let store_start = Instant::now();
             store_in_cache(
                 k_cache,
                 k,
@@ -64,11 +83,13 @@ impl Attention {
                 self.num_kv_heads,
                 self.head_dim,
             )?;
+            *self.store_in_cache_cost.borrow_mut() = store_start.elapsed().as_micros() as u64;
         }
 
         let target_dtype = q.dtype();
 
         if context.is_prefill {
+            debug!(tokens = q.dims()[0], "attention prefill path");
             let q_flash = to_flash_dtype(q)?;
             let k_flash = to_flash_dtype(k)?;
             let v_flash = to_flash_dtype(v)?;
@@ -86,8 +107,11 @@ impl Attention {
                 self.scale,
                 true,
             )?;
-            return from_flash_dtype(output, target_dtype);
+
+            return from_flash_dtype(output, target_dtype) ;
         }
+
+        debug!(batch = q.dims()[0], "attention decode path");
 
         let (k_cache, v_cache) = match (&self.k_cache, &self.v_cache) {
             (Some(k_cache), Some(v_cache)) => (k_cache, v_cache),
@@ -220,6 +244,7 @@ impl Attention {
         let k_flash = to_flash_dtype(&k_total)?;
         let v_flash = to_flash_dtype(&v_total)?;
 
+        let flash_start = Instant::now();
         let output = flash_attn_varlen(
             &q_flash,
             &k_flash,
@@ -231,6 +256,9 @@ impl Attention {
             self.scale,
             true,
         )?;
+        *self.flash_attn_cost.borrow_mut() = flash_start.elapsed().as_micros() as u64;
+
+        trace!("attention decode completed");
         from_flash_dtype(output, target_dtype)
     }
 }
@@ -299,7 +327,7 @@ fn cache_as_matrix(cache: &Tensor, num_heads: usize, head_dim: usize) -> Result<
         ),
     }
 }
-
+#[instrument(skip_all)]
 fn store_in_cache(
     cache: &Tensor,
     values: &Tensor,
@@ -328,38 +356,57 @@ fn store_in_cache(
         );
     }
 
-    let slot_vec = slot_mapping.to_vec1::<i64>()?;
-    if slot_vec.len() != value_dims[0] {
+    let token_count = value_dims[0];
+    let slot_mapping_len = slot_mapping.dim(0)?;
+    if slot_mapping_len != token_count {
         bail!(
             "slot mapping length {} must match number of tokens {}",
-            slot_vec.len(),
-            value_dims[0]
+            slot_mapping_len,
+            token_count
+        );
+    }
+    if token_count > i64::MAX as usize {
+        bail!(
+            "token count {} exceeds supported range",
+            token_count
         );
     }
 
-    let mut selected_rows = Vec::new();
-    let mut dst_slots = Vec::new();
-    for (row, slot) in slot_vec.into_iter().enumerate() {
-        if slot >= 0 {
-            selected_rows.push(row as i64);
-            dst_slots.push(slot as u32);
-        }
-    }
-
-    if selected_rows.is_empty() {
+    // Filter valid rows entirely on-device to avoid host round-trips.
+    let mask = slot_mapping.ge(0i64)?.contiguous()?;
+    let slot_count = mask
+        .to_dtype(DType::U32)?
+        .sum_all()?
+        .to_scalar::<u32>()? as usize;
+    if slot_count == 0 {
         return Ok(());
     }
 
     let device = values.device();
-    let slot_count = dst_slots.len();
-    let row_tensor = Tensor::from_vec(selected_rows, (slot_count,), device)?;
-    let slots_tensor = Tensor::from_vec(dst_slots, (slot_count,), device)?;
+    let token_count_i64 = token_count as i64;
 
-    let selected = values.i(&row_tensor)?;
+    let row_indices = Tensor::arange(0i64, token_count_i64, device)?;
+    let sentinel = Tensor::full(i64::MAX, (token_count,), device)?;
+    // Push invalid rows to the tail so we can take the leading valid span.
+    let masked_rows = mask
+        .where_cond(&row_indices, &sentinel)?
+        .contiguous()?;
+    let sorted_positions = masked_rows.arg_sort_last_dim(true)?;
+    let selected_positions = sorted_positions
+        .narrow(0, 0, slot_count)?
+        .to_dtype(DType::U32)?
+        .contiguous()?;
+
     let head_size = num_heads * head_dim;
-    let selected = selected.reshape((slot_count, head_size))?;
+    let selected = values
+        .i(&selected_positions)?
+        .reshape((slot_count, head_size))?;
 
+    let slot_indices = slot_mapping
+        .i(&selected_positions.to_dtype(DType::I64)?)?
+        .to_dtype(DType::U32)?
+        .contiguous()?;
+    let scatter_index = slot_indices.unsqueeze(1)?.repeat((1, head_size))?;
     let cache_view = cache_as_matrix(cache, num_heads, head_dim)?;
-    let scatter_index = slots_tensor.unsqueeze(1)?.repeat((1, head_size))?;
     cache_view.scatter_set(&scatter_index, &selected, 0)
 }

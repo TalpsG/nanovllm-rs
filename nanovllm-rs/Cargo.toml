@@ -2,21 +2,28 @@
 name = "nanovllm-rs"
 version = "0.1.0"
 edition = "2024"
+[featrues]
+profile = []
 
 [dependencies]
-candle-core = { version = "0.9.1", features = ["cuda"] }
+candle-core = { version = "0.9.1", features = ["cuda","cudnn"] }
 anyhow = "1"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 tokenizers = "0.22.1"
 xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
-candle-nn = { version = "0.9.1", features = ["cuda"] }
+candle-nn = { version = "0.9.1", features = ["cuda","cudnn"] }
 hf-hub = "0.4.3"
 lazy_static = "1.5.0"
 rand = "0.8"
-candle-flash-attn = { version = "0.9.1" }
+candle-flash-attn = { version = "0.9.1",features =["cudnn"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-attributes = "0.1"
+tracing-appender = "0.2.3"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+debug = true

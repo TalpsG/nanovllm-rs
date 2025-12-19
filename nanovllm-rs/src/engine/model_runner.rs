@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context as AnyhowContext, Result, anyhow, bail, ensure};
 use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_nn::VarBuilder;
 use tracing::{debug, info, info_span, instrument, warn};
 
+use crate::engine::llm_engine::{self, LlmEngine};
 use crate::engine::sequence::Sequence;
 use crate::layers::sampler::Sampler;
 use crate::models::qwen3::Qwen3ForCausalLM;
@@ -33,8 +35,7 @@ impl ModelRunner {
             bail!("tensor parallel execution is not yet implemented");
         }
 
-        let device = Device::new_cuda(rank)
-            .with_context(|| format!("failed to initialise CUDA device for rank {rank}"))?;
+        let device = llm_engine::DEVICE.clone();
 
         let weight_paths = collect_weight_paths(&config.model)?;
         let dtype = resolve_dtype(&config.hf_config);
@@ -409,6 +410,8 @@ impl ModelRunner {
 
     #[instrument(skip(self, seqs), fields(num_seqs = seqs.len(), is_prefill))]
     pub fn run(&mut self, seqs: &[Sequence], is_prefill: bool) -> Result<Vec<i64>> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static LOG_DEVICE_ONCE: AtomicBool = AtomicBool::new(false);
         let result = (|| {
             if seqs.is_empty() {
                 return Ok(Vec::new());
@@ -419,9 +422,25 @@ impl ModelRunner {
             } else {
                 self.prepare_decode(seqs)?
             };
+            let should_log_devices = !LOG_DEVICE_ONCE.swap(true, Ordering::Relaxed);
+            if should_log_devices {
+                debug!(
+                    input_device = ?input_ids.device(),
+                    positions_device = ?positions.device(),
+                    "tensor devices"
+                );
+            }
+            let forward_start = Instant::now();
             let logits = self.run_model(&input_ids, &positions, is_prefill, seqs.len())?;
+            let forward_elapsed = forward_start.elapsed();
+            if should_log_devices {
+                debug!(logits_device = ?logits.device(), "logits device");
+            }
             let temperatures = self.prepare_sample(seqs)?;
+            let sample_start = Instant::now();
             let tokens = self.sampler.forward(&logits, &temperatures)?;
+            let sample_elapsed = sample_start.elapsed();
+            debug!(?forward_elapsed, ?sample_elapsed, "step timings");
             let sampled = tokens.to_vec1::<i64>()?;
             Ok(sampled)
         })();

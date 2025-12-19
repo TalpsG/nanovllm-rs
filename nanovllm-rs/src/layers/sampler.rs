@@ -1,6 +1,5 @@
 use candle_core::{DType, Device, Result, Shape, Tensor, bail};
 use candle_nn::ops::softmax;
-use rand::Rng;
 
 pub struct Sampler;
 
@@ -33,16 +32,10 @@ impl Sampler {
     }
 
     fn sample_exponential_noise(shape: &Shape, device: &Device) -> Result<Tensor> {
-        let numel = shape.elem_count();
-        let mut rng = rand::thread_rng();
-        let mut values = Vec::with_capacity(numel);
-        for _ in 0..numel {
-            let u: f32 = rng.r#gen();
-            let u = u.max(1e-10);
-            let val = (-u.ln()).max(1e-10);
-            values.push(val);
-        }
-        Tensor::from_slice(values.as_slice(), shape.clone(), device)
+        Tensor::rand(1e-6f32, 1f32, shape.clone(), device)?
+            .log()?
+            .neg()?
+            .clamp(1e-10f32, f32::MAX)
     }
 
     fn sample_from_probs(probs: &Tensor, noise: &Tensor) -> Result<Tensor> {

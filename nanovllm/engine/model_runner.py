@@ -18,6 +18,7 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        print(f"block size: {self.block_size}")
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
@@ -175,6 +176,11 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
+        print(f"block_tables.shape: {block_tables.shape}")
+        print(f"slot_mapping.shape: {slot_mapping.shape}")
+        print(f"context_lens.shape: {context_lens.shape}")
+        print(f"positions.shape: {positions.shape}")
+
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 

@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use candle_core::Device;
@@ -31,6 +32,8 @@ pub struct LlmEngine {
     scheduler: Scheduler,
     model_runner: ModelRunner,
     // TODO: tensor-parallel worker management and CUDA graph integration.
+    decode_costs: Vec<Duration>,
+    prefill_costs: Vec<Duration>,
 }
 
 impl LlmEngine {
@@ -53,6 +56,8 @@ impl LlmEngine {
         );
 
         Ok(Self {
+            decode_costs: Vec::with_capacity(100),
+            prefill_costs: Vec::with_capacity(100),
             _config: model_runner.config().clone(),
             tokenizer,
             scheduler,
@@ -96,7 +101,13 @@ impl LlmEngine {
     pub fn step(&mut self) -> Result<(Vec<(u64, Vec<u32>)>, isize)> {
         let (handles, is_prefill) = self.scheduler.schedule()?;
         let batch: Vec<Sequence> = handles.iter().map(|seq| seq.borrow().clone()).collect();
+        let start = Instant::now();
         let token_ids = self.model_runner.run(&batch, is_prefill)?;
+        if !is_prefill{
+            self.decode_costs.push(start.elapsed());
+        }else{
+            self.prefill_costs.push(start.elapsed());
+        }
         let finished_flags = self.scheduler.postprocess(&handles, &token_ids)?;
 
         let mut outputs = Vec::new();
@@ -170,6 +181,28 @@ impl LlmEngine {
         }
         let trimmed = prompt.trim();
         format!("<|im_start|>user\n{trimmed}\n<|im_end|>\n<|im_start|>assistant\n")
+    }
+
+    pub fn profile_decode(&self) {
+        // Log profiling information for decode steps (unit is second)
+        println!("Total decode steps: {}", self.decode_costs.len());
+        println!("Total decode time: {:?}", self.decode_costs.iter().sum::<Duration>().as_secs_f32());
+        println!("Average decode time per step: {:?}", if self.decode_costs.len() >0 {self.decode_costs.iter().sum::<Duration>().as_secs_f32() / (self.decode_costs.len() as u32) as f32} else {Duration::ZERO.as_secs_f32()} );
+        println!("Max decode time per step: {:?}", if self.decode_costs.len() >0 {self.decode_costs.iter().max().unwrap().as_secs_f32()} else {Duration::ZERO.as_secs_f32()} );
+        println!("Min decode time per step: {:?}", if self.decode_costs.len() >0 {self.decode_costs.iter().min().unwrap().as_secs_f32()} else {Duration::ZERO.as_secs_f32()} );
+    }
+    pub fn profile_prefill(&self) {
+        // Log profiling information for prefill steps (unit is second)
+        println!("Total prefill steps: {}", self.prefill_costs.len());
+        println!("Total prefill time: {:?}", self.prefill_costs.iter().sum::<Duration>().as_secs_f32());
+        println!("Average prefill time per step: {:?}", if self.prefill_costs.len() >0 {self.prefill_costs.iter().sum::<Duration>().as_secs_f32() / (self.prefill_costs.len() as u32) as f32} else {Duration::ZERO.as_secs_f32()} );
+        println!("Max prefill time per step: {:?}", if self.prefill_costs.len() >0 {self.prefill_costs.iter().max().unwrap().as_secs_f32()} else {Duration::ZERO.as_secs_f32()} );
+        println!("Min prefill time per step: {:?}", if self.prefill_costs.len() >0 {self.prefill_costs.iter().min().unwrap().as_secs_f32()} else {Duration::ZERO.as_secs_f32()} );
+    }
+    pub fn profile_flash_attention(&self) {
+        // Log profiling information for flash attention (unit is second)
+
+
     }
 }
 

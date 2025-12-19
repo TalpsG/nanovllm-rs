@@ -2,9 +2,11 @@ import torch
 from torch import nn
 import triton
 import triton.language as tl
+import time
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+import nanovllm.utils.profile as profile
 
 
 @triton.jit
@@ -39,7 +41,6 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     assert slot_mapping.numel() == N
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
-
 class Attention(nn.Module):
 
     def __init__(
@@ -60,7 +61,9 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
+            store_kvcache_start = time.perf_counter()
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            profile._STORE_KVCACHE_COST.append(time.perf_counter() - store_kvcache_start)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
@@ -69,7 +72,11 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
+            start_time = time.perf_counter()
+            print(q.shape,k_cache.shape,v_cache.shape)
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                         cache_seqlens=context.context_lens, block_table=context.block_tables, 
                                         softmax_scale=self.scale, causal=True)
+            profile._DECODE_ATTN_COST.append(time.perf_counter() - start_time)
+            
         return o
